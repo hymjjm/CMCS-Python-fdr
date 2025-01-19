@@ -1,41 +1,79 @@
 import os
-import re
-
+import asyncio
+import aiohttp
 import pandas as pd
-import requests
-from datetime import datetime
+from tqdm.asyncio import tqdm
 
+async def fetch_sequence_async(chromosome, start, end, species="human", retries=3, delay=1.5):
+    """
+    异步从 Ensembl 获取基因组序列，支持重试机制
+    """
+    url = f"https://rest.ensembl.org/sequence/region/{species}/{chromosome}:{start}..{end}:1"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
-def fetch_sequence_from_ucsc(chromosome, start, end, build):
-    """
-    从 UCSC Genome Browser 远程获取基因组序列
-    """
-    url = f"http://genome.ucsc.edu/cgi-bin/das/{build}/dna?segment={chromosome}:{start},{end}"
-    response = requests.get(url)
-    if response.status_code == 200:
+    for attempt in range(retries):
         try:
-            sequence = ''.join(response.text.split("<DNA length=")[-1].split("</DNA>")[0].strip().split())
-            return sequence.upper()
-        except IndexError:
-            return "N/A"
-    else:
-        raise Exception(f"Failed to fetch sequence from UCSC: {response.status_code}, {response.text}")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result.get("seq", "").upper()
+                    elif response.status == 429:
+                        # print(f"Rate limit hit. Retrying after {delay * (attempt + 1)} seconds...")
+                        await asyncio.sleep(delay * (attempt + 1))
+                    else:
+                        print(f"Error {response.status}: {await response.text()}")
+                        return "N/A"
+        except Exception as e:
+            print(f"Error fetching sequence: {e}")
+            await asyncio.sleep(delay * (attempt + 1))
+    print("Max retries reached.")
+    return "N/A"
 
 
-def map_genome_version(version):
+async def process_row(row, species="human"):
     """
-    将基因组版本映射到 UCSC 所需的版本
+    异步处理单条记录，获取上下文序列
     """
-    mapping = {
-        "37": "hg19",
-        "38": "hg38"
-    }
-    return mapping.get(str(version), "unknown")
+    chrom = row['CHROMOSOME']
+    pos = row['GENOME_START']
+    wt_allele = row['GENOMIC_WT_ALLELE']
+    mut_allele = row['GENOMIC_MUT_ALLELE']
 
+    try:
+        # 获取上游和下游序列
+        upstream = await fetch_sequence_async(chrom, pos - 6, pos - 1, species)
+        downstream = await fetch_sequence_async(chrom, pos + 1, pos + 6, species)
 
-def process_mutation_data(input_file, df,outfile_name, cancer_type):
+        # 检查序列长度并调整为只取 1 个碱基
+        if len(upstream) < 6:
+            upstream = await fetch_sequence_async(chrom, pos - 1, pos - 1, species)
+        else:
+            upstream = upstream.rjust(6, "-")
+
+        if len(downstream) < 6:
+            downstream = await fetch_sequence_async(chrom, pos + 1, pos + 1, species)
+        else:
+            downstream = downstream.ljust(6, "-")
+        # 拼接
+        context = f"{upstream}[{wt_allele}>{mut_allele}]{downstream}"
+        # 返回结果
+        return context
+
+    except Exception as e:
+        print(f"Error processing row: {e}")
+        return "N/A"
+
+async def process_chunk_async(df_chunk, species="human"):
     """
-    处理突变数据，提取单碱基替换（SBS）并通过远程加载获取上下文信息
+    异步处理数据分片
+    """
+    tasks = [process_row(row, species) for _, row in df_chunk.iterrows()]
+    return await tqdm.gather(*tasks, desc="Processing rows", total=len(df_chunk))
+
+def process_mutation_data(input_file, df, outfile_name, cancer_type, batch_size, species):
+    """
+    主数据处理函数，支持异步批量请求和进度显示
     """
     print(f"Loading input file: {input_file}")
 
@@ -43,101 +81,65 @@ def process_mutation_data(input_file, df,outfile_name, cancer_type):
     df = df[(df['GENOMIC_WT_ALLELE'].str.len() == 1) & (df['GENOMIC_MUT_ALLELE'].str.len() == 1)]
     print(f"Records after SBS filtering: {len(df)}")
 
-    # 添加手动指定的 CANCER_TYPE 列
+    # 添加或确认 'CANCER_TYPE' 列
     if 'CANCER_TYPE' not in df.columns:
-        print(f"CANCER_TYPE column not found. Adding default value: {cancer_type}")
         df['CANCER_TYPE'] = cancer_type
 
     # 添加或确认 'Sample' 列
     if 'Sample' not in df.columns:
-        print("Adding 'Sample' column with default values.")
         df['Sample'] = os.path.splitext(os.path.basename(input_file))[0]
 
-    # 锁定 DataFrame 避免迭代中被修改
-    locked_df = df.copy()
-
-    # 提取上下文信息
+    # 按批次处理数据
     contexts = []
-    processed_count = 0
+    total_batches = len(df) // batch_size + int(len(df) % batch_size != 0)
+    print(f"Processing {total_batches} batches...")
 
-    for index, row in locked_df.iterrows():
-        processed_count += 1
-        chrom = f"chr{row['CHROMOSOME']}"  # 为染色体添加前缀
-        pos = row['GENOME_START']
-        wt_allele = row['GENOMIC_WT_ALLELE']
-        mut_allele = row['GENOMIC_MUT_ALLELE']
-        genome_version = row['GENOME_VERSION']
+    for i, start in enumerate(range(0, len(df), batch_size)):
+        df_chunk = df.iloc[start:start + batch_size]
+        print(f"Processing batch {i + 1}/{total_batches}...")
 
-        # 映射到 UCSC 所需的基因组版本
-        ucsc_build = map_genome_version(genome_version)
-        if ucsc_build == "unknown":
-            print(f"Unknown genome version: {genome_version}")
-            contexts.append("N/A")
-            continue
-
-        print(f"Processing record {processed_count}/{len(locked_df)}: {chrom}:{pos} ({ucsc_build})")
-
-        # 获取上下文序列
-        try:
-            upstream = fetch_sequence_from_ucsc(chromosome=chrom, start=pos - 1, end=pos - 1, build=ucsc_build)
-            downstream = fetch_sequence_from_ucsc(chromosome=chrom, start=pos + 1, end=pos + 1, build=ucsc_build)
-            if upstream != "N/A" and downstream != "N/A":
-                context = f"{upstream}[{wt_allele}>{mut_allele}]{downstream}"
-            else:
-                context = "N/A"
-        except Exception as e:
-            context = "N/A"
-            print(f"Error fetching context for {chrom}:{pos} - {e}")
-
-        contexts.append(context)
+        # 异步处理当前分片
+        loop = asyncio.get_event_loop()
+        chunk_contexts = loop.run_until_complete(process_chunk_async(df_chunk, species))
+        contexts.extend(chunk_contexts)
 
     # 添加上下文信息到 DataFrame
-    locked_df['Context'] = contexts
+    df['Context'] = contexts
 
-    # 更新 CHROMOSOME 列，添加 chr 前缀
-    locked_df['CHROMOSOME'] = locked_df['CHROMOSOME'].apply(lambda x: f"chr{x}")
+    # 为 CHROMOSOME 列添加 "chr" 前缀
+    df['CHROMOSOME'] = df['CHROMOSOME'].apply(lambda x: f"chr{x}" if not str(x).startswith("chr") else x)
 
-    # 更新 GENOME_VERSION 列，添加 GRCh 前缀
-    locked_df['GENOME_VERSION'] = locked_df['GENOME_VERSION'].apply(
-        lambda x: f"GRCh{x}" if not str(x).startswith("GRCh") else x)
+    # 为 GENOME_VERSION 列添加 "GRCh" 前缀
+    df['GENOME_VERSION'] = df['GENOME_VERSION'].apply(
+        lambda x: f"GRCh{x}" if not str(x).startswith("GRCh") else x
+    )
 
-    # 清理 Context 列
-    locked_df['Context'] = locked_df['Context'].str.replace(r'[^ACGT\[\]>]', '', regex=True)
-    # 删除第一个和倒数第二个字符
-    locked_df['Context'] = locked_df['Context'].apply(lambda x: x[1:-1] if len(x) > 2 else x)
-
-    # 按指定顺序选择和重命名列
+    # 按指定列顺序保存结果
     columns_to_keep = [
         'GENE_SYMBOL', 'CHROMOSOME', 'GENOME_START', 'GENOMIC_WT_ALLELE',
         'GENOMIC_MUT_ALLELE', 'STRAND', 'MUTATION_DESCRIPTION', 'Sample',
         'CANCER_TYPE', 'GENOME_VERSION', 'Context'
     ]
-    columns_to_rename = [
+    df = df[columns_to_keep]
+    df.columns = [
         'GENE_SYMBOL', 'Chromosome', 'Position', 'Reference',
         'Alternate', 'STRAND', 'MUTATION_DESCRIPTION', 'Sample',
         'CANCER_TYPE', 'GENOME_VERSION', 'Context'
     ]
 
-    # 处理缺少的列
-    for col in columns_to_keep:
-        if col not in locked_df.columns:
-            print(f"Missing column: {col}, filling with 'N/A'")
-            locked_df[col] = "N/A"
-
-    output_df = locked_df[columns_to_keep]
-    output_df.columns = columns_to_rename
-
     # 保存结果
-    output_df.to_csv(outfile_name, sep="\t", index=False)
+    df.to_csv(outfile_name, sep="\t", index=False)
     print(f"Processing completed. Results saved to: {outfile_name}")
 
-    return output_df
+    return df
 
 
-# # 示例调用
+# 示例调用
 # process_mutation_data(
-#     input_file="E:/jjm/work/簇突变/Pyth_fdr/input_file/example/Cosmic_GenomeScreensMutant_Tsv_v99_GRCh37_PD4103a.tsv",
-#     df=df,
-#     outfile_name ="E:/jjm/work/簇突变/Pyth_fdr/output_file/Tsv_v99_GRCh37_PD4103a_BRCA.tsv", #原始文件处理后的名字
+#     input_file="path_to_input_file.tsv",
+#     df=pd.read_csv("path_to_input_file.tsv", sep="\t"),
+#     outfile_name="path_to_output_file.tsv",
 #     cancer_type="BRCA",
+#     batch_size=100,
+#     species="human"
 # )

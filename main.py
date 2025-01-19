@@ -219,6 +219,8 @@ def main():
             df=df,
             outfile_name=outfile_name,
             cancer_type=cancer_type,
+            batch_size=40,
+            species="human"
         )
 
     # 提取真实数据的 IMD 值
